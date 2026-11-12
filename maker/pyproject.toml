@@ -1,0 +1,13 @@
+[project]
+name = "bspack"
+version = "0.1.0"
+description = "Maker for the bootsplashd .bsp boot-animation format"
+requires-python = ">=3.9"
+dependencies = ["pillow"]
+
+[project.scripts]
+bspack = "bspack.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+maker/out/
+maker/extracted/
+*.bsp
+*.mp4
+*.zip
+player/build/
