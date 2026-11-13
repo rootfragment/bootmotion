@@ -15,6 +15,7 @@
 
 #include <fcntl.h>        /* open */
 #include <linux/fb.h>     /* framebuffer structs and ioctl numbers */
+#include <linux/kd.h>     /* KDGETMODE: is a console in text mode? */
 #include <signal.h>       /* sigaction: catching Ctrl+C */
 #include <stdint.h>       /* uint8_t, uint32_t, ... fixed-size integers */
 #include <stdio.h>        /* fprintf, perror */
@@ -28,6 +29,10 @@
 #include <zlib.h>         /* uncompress */
 
 #define HOLD_SECONDS 3    /* how long the last frame stays on screen */
+
+#ifndef CONSOLE_DEVICE
+#define CONSOLE_DEVICE "/dev/tty0"   /* tty0 = the virtual console currently on screen */
+#endif
 
 #define HEADER_SIZE       64
 #define INDEX_ENTRY_SIZE  16
@@ -208,8 +213,7 @@ static uint64_t frame_start_time_ns(const Pack *pack, uint32_t frame)
 static void open_screen(Screen *screen, const char *path)
 {
     int fd = open(path, O_RDWR);
- 
-   if (fd < 0)
+    if (fd < 0)
         die_errno(path);
 
     /* ioctl asks the display driver questions. */
@@ -239,6 +243,37 @@ static void clear_screen(Screen *screen)
 {
     for (uint32_t y = 0; y < screen->height; y++)
         memset(screen->pixels + (size_t)y * screen->bytes_per_row, 0, (size_t)screen->width * 4);
+}
+
+/* The text console draws a blinking cursor onto the same screen memory we draw to.
+ * The escape sequence "ESC [ ? 25 l" tells it to hide the cursor and "ESC [ ? 25 h" shows it
+ * again. We only do this on a console that is in text mode, so a desktop session's console is
+ * never touched. If the player is killed before it can show the cursor again, type `reset`. */
+static int console_fd = -1;      /* open console, only set if we hid its cursor */
+
+static void show_cursor(void)
+{
+    if (console_fd >= 0) {
+        ssize_t written = write(console_fd, "\033[?25h", 6);
+        (void)written;
+        close(console_fd);
+        console_fd = -1;
+    }
+}
+
+static void hide_cursor(void)
+{
+    int fd = open(CONSOLE_DEVICE, O_WRONLY);
+    if (fd < 0)
+        return;                                  /* not fatal: the cursor may just blink */
+
+    int mode = -1;
+    if (ioctl(fd, KDGETMODE, &mode) < 0 || mode != KD_TEXT || write(fd, "\033[?25l", 6) != 6) {
+        close(fd);
+        return;
+    }
+    console_fd = fd;
+    atexit(show_cursor);                         /* runs on normal exit and on die() */
 }
 
 /* Copy one decoded frame to the middle of the screen.
@@ -296,6 +331,7 @@ int main(int argc, char **argv)
     load_pack(&pack, pack_path);
     open_screen(&screen, screen_path);
     clear_screen(&screen);
+    hide_cursor();
 
     /* Ctrl+C or `kill` sets quit_requested instead of killing the program mid-frame.
      * SA_RESTART is not set, so a sleeping program wakes up right away. */
@@ -326,4 +362,4 @@ int main(int argc, char **argv)
         sleep(HOLD_SECONDS);
 
     return 0;
-}
+}       
