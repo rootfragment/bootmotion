@@ -34,7 +34,6 @@ def cmd_info(a):
     print(f"fps        : {h.fps:g}")
     print(f"frames     : {h.frame_count} ({h.frame_count / h.fps:.2f}s)")
     print(f"compression: {COMP_NAMES[h.compression]}")
-    print(f"loop       : {bool(h.flags & FLAG_LOOP)}")
 
 
 def cmd_extract(a):

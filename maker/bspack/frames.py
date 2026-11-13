@@ -7,30 +7,34 @@ import sys
 
 
 def detect_resolution():
-    # 1. DRM: first connected connector's preferred mode
+    """Visible display size. Tries DRM, then the framebuffer's mode, then xrandr."""
+    # 1. DRM: first connected connector; its first listed mode is the preferred (native) one.
     for conn in sorted(glob.glob("/sys/class/drm/card*-*")):
         try:
-            if open(f"{conn}/status").read().strip() != "connected":
+            if open(conn + "/status").read().strip() != "connected":
                 continue
-            m = re.match(r"(\d+)x(\d+)", open(f"{conn}/modes").readline().strip())
+            m = re.match(r"(\d+)x(\d+)", open(conn + "/modes").readline().strip())
             if m:
                 return int(m.group(1)), int(m.group(2))
         except Exception:
             pass
-    # 2. framebuffer
+    # 2. Framebuffer mode list (the visible mode; fb0/virtual_size can be larger and is not used).
     try:
-        w, h = open("/sys/class/graphics/fb0/virtual_size").read().strip().split(",")
-        return int(w), int(h)
+        m = re.search(r"(\d+)x(\d+)", open("/sys/class/graphics/fb0/modes").readline())
+        if m:
+            return int(m.group(1)), int(m.group(2))
     except Exception:
         pass
-    # 3. xrandr (desktop only)
+    # 3. xrandr (only works inside a desktop session).
     try:
-        m = re.search(r"current (\d+) x (\d+)", subprocess.check_output(["xrandr"], text=True))
+        out = subprocess.check_output(["xrandr"], text=True)
+        m = re.search(r"current (\d+) x (\d+)", out)
         if m:
             return int(m.group(1)), int(m.group(2))
     except Exception:
         pass
     return None
+
 
 def get_resolution(arg):
     #get res from args, sanitize data and fix
