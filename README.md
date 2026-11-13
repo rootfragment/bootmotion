@@ -102,13 +102,13 @@ The player prints nothing when it succeeds, and prints one error line and exits 
 - Maker: `boot.mp4` at 1366x768, 24 fps, 3 s gave 72 frames, 302.1 MB raw down to 38.3 MB. `check.py` passed, with pixels within 4 of 255 of an independent ffmpeg extraction (colour-conversion rounding).
 - Player, against a plain file standing in for `/dev/fb0`: the final frame matched byte for byte on same-size, larger and smaller screens; a 2 s pack plus the 3 s hold took 5.01 s; truncated, random, empty and missing files each gave one error line; a sanitizer build found no memory errors.
 - Player, on real hardware: the animation played correctly from a text console on the author's laptop. This is one machine, so other drivers are untested.
+- Fixed blinking cursor on boot animation without switching terminal to graphics mode to avoid being stuck at boot in graphics mode. 
 
 ## Known limits
 
 - The player needs a 32 bits-per-pixel framebuffer and exits with an error otherwise.
 - It never skips frames, so on a slow machine playback runs slow instead of dropping frames.
 - A pack is fixed to one resolution. A different screen size gets a cropped or bordered picture, so make one pack per screen.
-- The console cursor can blink over the animation, which is cosmetic.
 - It does not run at boot, and there is no quit signal or timeout yet.
 - Compression ratio depends on the video. Heavy motion packs much larger than mostly static footage.
 - Auto-detect after the DRM-first fix has not been confirmed on real hardware. Passing `--res` always works.
