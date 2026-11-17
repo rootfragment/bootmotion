@@ -1,19 +1,24 @@
 /*
  * player.c - plays a .bsp animation once on the Linux framebuffer, then holds the last frame.
  *
- *   sudo ./player boot.bsp            run from a text console (Ctrl+Alt+F3); Ctrl+C quits
+ *   sudo ./player [--hold SECONDS|forever] [--timeout SECONDS] [--fb DEVICE] boot.bsp
+ *
+ * Run it from a text console (Ctrl+Alt+F3). It stops at the first of: the animation and hold
+ * time finishing, Ctrl+C / SIGTERM / SIGHUP, or the timeout (a failsafe, so the screen can
+ * never be left hanging).
  *
  * How the program flows (see main() at the bottom):
  *
  *   1. load_pack()      open the .bsp file and read its header
  *   2. open_screen()    open /dev/fb0 so we can write pixels straight to the screen
  *   3. for each frame:  decode_frame()  ->  draw_frame()  ->  sleep_until() the next frame is due
- *   4. hold the last frame for a few seconds, then exit
+ *   4. hold the last frame (for --hold seconds, or until told to quit), then exit
  *
  * The file format is described in docs/FORMAT.md.
  */
 
 #include <fcntl.h>        /* open */
+#include <getopt.h>       /* getopt_long: command-line options */
 #include <linux/fb.h>     /* framebuffer structs and ioctl numbers */
 #include <linux/kd.h>     /* KDGETMODE: is a console in text mode? */
 #include <signal.h>       /* sigaction: catching Ctrl+C */
@@ -28,7 +33,8 @@
 #include <unistd.h>       /* close, sleep */
 #include <zlib.h>         /* uncompress */
 
-#define HOLD_SECONDS 3    /* how long the last frame stays on screen */
+#define DEFAULT_HOLD_SECONDS     3    /* how long the last frame stays after the animation */
+#define DEFAULT_TIMEOUT_SECONDS  30   /* hard limit on total run time (0 = no limit) */
 
 #ifndef CONSOLE_DEVICE
 #define CONSOLE_DEVICE "/dev/tty0"   /* tty0 = the virtual console currently on screen */
@@ -315,16 +321,84 @@ static void sleep_until(struct timespec start, uint64_t offset_ns)
 }
 
 
+/* Nanoseconds since `start`. */
+static uint64_t elapsed_ns(struct timespec start)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t seconds = (int64_t)now.tv_sec - (int64_t)start.tv_sec;
+    int64_t nanos   = (int64_t)now.tv_nsec - (int64_t)start.tv_nsec;
+    return (uint64_t)(seconds * 1000000000LL + nanos);
+}
+
+static uint64_t min_u64(uint64_t a, uint64_t b)
+{
+    return a < b ? a : b;
+}
+
+
+/* ---------- command line ---------- */
+
+static void usage(const char *program)
+{
+    fprintf(stderr,
+            "usage: %s [options] file.bsp\n"
+            "  --hold SECONDS|forever   keep the last frame this long after the animation (default %d)\n"
+            "  --timeout SECONDS        always exit after this many seconds in total; 0 = no limit (default %d)\n"
+            "  --fb DEVICE              framebuffer device (default /dev/fb0)\n"
+            "Ctrl+C, SIGTERM and SIGHUP stop the player at any time.\n",
+            program, DEFAULT_HOLD_SECONDS, DEFAULT_TIMEOUT_SECONDS);
+}
+
+/* Read a whole number of seconds from the command line, or stop with an error. */
+static long parse_seconds(const char *text, const char *option)
+{
+    char *end;
+    long value = strtol(text, &end, 10);
+    if (*text == '\0' || *end != '\0' || value < 0 || value > 86400) {
+        fprintf(stderr, "player: bad value '%s' for %s\n", text, option);
+        exit(1);
+    }
+    return value;
+}
+
+
 /* ---------- main ---------- */
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s file.bsp [/dev/fb0]\n", argv[0]);
+    long        hold_seconds    = DEFAULT_HOLD_SECONDS;     /* -1 means "until told to quit" */
+    long        timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+    const char *screen_path     = "/dev/fb0";
+
+    static const struct option options[] = {
+        { "hold",    required_argument, NULL, 'h' },
+        { "timeout", required_argument, NULL, 't' },
+        { "fb",      required_argument, NULL, 'f' },
+        { NULL, 0, NULL, 0 }
+    };
+    int option;
+    while ((option = getopt_long(argc, argv, "", options, NULL)) != -1) {
+        switch (option) {
+        case 'h':
+            hold_seconds = (strcmp(optarg, "forever") == 0) ? -1 : parse_seconds(optarg, "--hold");
+            break;
+        case 't':
+            timeout_seconds = parse_seconds(optarg, "--timeout");
+            break;
+        case 'f':
+            screen_path = optarg;
+            break;
+        default:
+            usage(argv[0]);
+            return 1;
+        }
+    }
+    if (optind != argc - 1) {              /* exactly one file name must be left */
+        usage(argv[0]);
         return 1;
     }
-    const char *pack_path   = argv[1];
-    const char *screen_path = argc > 2 ? argv[2] : "/dev/fb0";
+    const char *pack_path = argv[optind];
 
     Pack   pack;
     Screen screen;
@@ -333,11 +407,16 @@ int main(int argc, char **argv)
     clear_screen(&screen);
     hide_cursor();
 
-    /* Ctrl+C or `kill` sets quit_requested instead of killing the program mid-frame.
+    /* Ctrl+C, `kill` (SIGTERM) or a closed terminal (SIGHUP) set quit_requested instead of
+     * killing the program mid-frame, so the cursor is always restored on the way out.
      * SA_RESTART is not set, so a sleeping program wakes up right away. */
     struct sigaction action = { .sa_handler = on_signal };
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGHUP, &action, NULL);
+
+    /* All times below are "nanoseconds after the start of playback". */
+    uint64_t timeout_ns = timeout_seconds ? (uint64_t)timeout_seconds * 1000000000ULL : UINT64_MAX;
 
     /* Two frame buffers: the frame being built, and the one before it (needed for delta).
      * Even frames use buffers[0], odd frames use buffers[1], so they swap every frame. */
@@ -349,17 +428,31 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     for (uint32_t frame = 0; frame < pack.frame_count && !quit_requested; frame++) {
+        if (elapsed_ns(start) >= timeout_ns)
+            break;
+
         uint8_t *current  = buffers[frame % 2];
         uint8_t *previous = (frame == 0) ? NULL : buffers[(frame + 1) % 2];
 
         decode_frame(&pack, frame, previous, current);
         draw_frame(&screen, &pack, current);
-        sleep_until(start, frame_start_time_ns(&pack, frame + 1));
+
+        /* Wait for the next frame, but never past the timeout. */
+        sleep_until(start, min_u64(frame_start_time_ns(&pack, frame + 1), timeout_ns));
     }
 
-    /* Leave the last frame on screen for a moment (cut short by Ctrl+C). */
-    if (!quit_requested)
-        sleep(HOLD_SECONDS);
+    /* Hold the last frame. This ends at the first of: a signal, the hold time, or the timeout. */
+    uint64_t animation_end_ns = frame_start_time_ns(&pack, pack.frame_count);
+    uint64_t hold_end_ns = (hold_seconds < 0) ? UINT64_MAX
+                                              : animation_end_ns + (uint64_t)hold_seconds * 1000000000ULL;
+    uint64_t stop_ns = min_u64(hold_end_ns, timeout_ns);
+
+    /* Sleep in slices of at most one second, so a signal or the deadline is noticed promptly. */
+    while (!quit_requested && elapsed_ns(start) < stop_ns)
+        sleep_until(start, min_u64(elapsed_ns(start) + 1000000000ULL, stop_ns));
+
+    if (!quit_requested && timeout_ns < hold_end_ns && elapsed_ns(start) >= timeout_ns)
+        fprintf(stderr, "player: timeout of %ld s reached, exiting\n", timeout_seconds);
 
     return 0;
-}       
+}
