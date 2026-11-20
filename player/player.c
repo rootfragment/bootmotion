@@ -10,13 +10,17 @@
  * How the program flows (see main() at the bottom):
  *
  *   1. load_pack()      open the .bsp file and read its header
- *   2. open_screen()    open /dev/fb0 so we can write pixels straight to the screen
- *   3. for each frame:  decode_frame()  ->  draw_frame()  ->  sleep_until() the next frame is due
+ *   2. open_screen_quietly()  open /dev/fb0 so we can write pixels straight to the screen
+ *   3. for each frame:  decode_frame()  ->  follow_screen()  ->  draw_frame()  ->  sleep_until()
+ *      follow_screen() checks that /dev/fb0 is still the same framebuffer. During boot the
+ *      kernel swaps the early firmware framebuffer for the real graphics driver's; when that
+ *      happens we switch to the new one and redraw.
  *   4. hold the last frame (for --hold seconds, or until told to quit), then exit
  *
  * The file format is described in docs/FORMAT.md.
  */
 
+#include <errno.h>        /* errno */
 #include <fcntl.h>        /* open */
 #include <getopt.h>       /* getopt_long: command-line options */
 #include <linux/fb.h>     /* framebuffer structs and ioctl numbers */
@@ -65,11 +69,24 @@ typedef struct {
 } Pack;
 
 typedef struct {
+    int      valid;             /* 1 = mapped to a framebuffer we can draw on, 0 = none right now */
     uint8_t *pixels;            /* memory of the top-left visible pixel */
     uint32_t width;             /* screen size in pixels */
     uint32_t height;
     uint32_t bytes_per_row;     /* may be larger than width * 4 */
+
+    /* Kept so we can unmap it later and notice when the framebuffer has been replaced. */
+    uint8_t      *memory;       /* start of the whole mapping */
+    size_t        memory_length;
+    char          id[16];       /* the driver's name for it, e.g. "simpledrmdrmfb" */
+    unsigned long physical_address;
 } Screen;
+
+/* What the driver tells us about a framebuffer. */
+typedef struct {
+    struct fb_var_screeninfo var;   /* resolution, bits per pixel, scroll position */
+    struct fb_fix_screeninfo fix;   /* name, bytes per row, memory address and size */
+} ScreenInfo;
 
 
 /* ---------- small helpers ---------- */
@@ -215,40 +232,121 @@ static uint64_t frame_start_time_ns(const Pack *pack, uint32_t frame)
 
 /* ---------- 2. the screen ---------- */
 
-/* Open the framebuffer device and map its pixel memory so we can write to it directly. */
-static void open_screen(Screen *screen, const char *path)
+/* Ask the driver about the framebuffer at `path`. On success returns NULL and leaves the device
+ * open in *fd. On failure returns a message and leaves nothing open. */
+static const char *query_screen(const char *path, int *fd, ScreenInfo *info)
 {
-    int fd = open(path, O_RDWR);
-    if (fd < 0)
-        die_errno(path);
+    *fd = open(path, O_RDWR);
+    if (*fd < 0)
+        return strerror(errno);
 
     /* ioctl asks the display driver questions. */
-    struct fb_var_screeninfo var;   /* resolution, bits per pixel, scroll position */
-    struct fb_fix_screeninfo fix;   /* bytes per row, total size of the pixel memory */
-    if (ioctl(fd, FBIOGET_VSCREENINFO, &var) < 0)
-        die_errno("ioctl FBIOGET_VSCREENINFO");
-    if (ioctl(fd, FBIOGET_FSCREENINFO, &fix) < 0)
-        die_errno("ioctl FBIOGET_FSCREENINFO");
+    if (ioctl(*fd, FBIOGET_VSCREENINFO, &info->var) < 0 || ioctl(*fd, FBIOGET_FSCREENINFO, &info->fix) < 0) {
+        const char *why = strerror(errno);
+        close(*fd);
+        return why;
+    }
+    return NULL;
+}
+
+/* Is the framebuffer described by `info` the one we are already drawing on?
+ * The name, memory address and size together tell two framebuffers apart. */
+static int same_screen(const Screen *screen, const ScreenInfo *info)
+{
+    char id[16];
+    memcpy(id, info->fix.id, sizeof id);
+    id[sizeof id - 1] = '\0';
+    return strcmp(id, screen->id) == 0
+        && info->fix.smem_start == screen->physical_address
+        && info->var.xres == screen->width
+        && info->var.yres == screen->height
+        && info->fix.line_length == screen->bytes_per_row;
+}
+
+/* Open the framebuffer and map its pixel memory so we can write to it directly.
+ * Returns NULL on success, or a message saying what went wrong. */
+static const char *open_screen_quietly(Screen *screen, const char *path)
+{
+    int fd;
+    ScreenInfo info;
+    const char *problem = query_screen(path, &fd, &info);
+    if (problem)
+        return problem;
 
     /* The pack stores 4 bytes per pixel (blue, green, red, unused), so the screen must too. */
-    if (var.bits_per_pixel != 32)
-        die("screen is not 32 bits per pixel");
+    if (info.var.bits_per_pixel != 32) {
+        close(fd);
+        return "screen is not 32 bits per pixel";
+    }
 
-    uint8_t *memory = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (memory == MAP_FAILED)
-        die_errno("mmap framebuffer");
+    /* The visible area (starting at the scroll position) must lie inside the memory. */
+    uint64_t first_byte = (uint64_t)info.var.yoffset * info.fix.line_length + (uint64_t)info.var.xoffset * 4;
+    uint64_t last_byte  = first_byte + (uint64_t)(info.var.yres - 1) * info.fix.line_length
+                          + (uint64_t)info.var.xres * 4;
+    if (info.var.xres == 0 || info.var.yres == 0 || last_byte > info.fix.smem_len) {
+        close(fd);
+        return "framebuffer size does not fit its memory";
+    }
+
+    uint8_t *memory = mmap(NULL, info.fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (memory == MAP_FAILED) {
+        problem = strerror(errno);
+        close(fd);
+        return problem;
+    }
     close(fd);
 
-    screen->width         = var.xres;
-    screen->height        = var.yres;
-    screen->bytes_per_row = fix.line_length;
-    screen->pixels        = memory + var.yoffset * fix.line_length + var.xoffset * 4;
+    memset(screen, 0, sizeof *screen);
+    screen->valid         = 1;
+    screen->memory        = memory;
+    screen->memory_length = info.fix.smem_len;
+    screen->pixels        = memory + first_byte;
+    screen->width         = info.var.xres;
+    screen->height        = info.var.yres;
+    screen->bytes_per_row = info.fix.line_length;
+    screen->physical_address = info.fix.smem_start;
+    memcpy(screen->id, info.fix.id, sizeof info.fix.id);
+    screen->id[sizeof screen->id - 1] = '\0';
+    return NULL;
+}
+
+/* Stop using the current framebuffer. */
+static void close_screen(Screen *screen)
+{
+    if (screen->memory)
+        munmap(screen->memory, screen->memory_length);
+    memset(screen, 0, sizeof *screen);
 }
 
 static void clear_screen(Screen *screen)
 {
+    if (!screen->valid)
+        return;
     for (uint32_t y = 0; y < screen->height; y++)
         memset(screen->pixels + (size_t)y * screen->bytes_per_row, 0, (size_t)screen->width * 4);
+}
+
+/* During boot the kernel replaces the early firmware framebuffer with the real graphics driver's.
+ * Memory we mapped from the old one stops reaching the display, so we must notice and move.
+ * Call this before drawing. If the framebuffer was replaced, or had gone away and is back, this
+ * switches to the new one, paints it black and returns 1: the caller must then draw the current
+ * frame again. If nothing changed, or there is no screen right now, it returns 0. */
+static int follow_screen(Screen *screen, const char *path)
+{
+    if (screen->valid) {
+        int fd;
+        ScreenInfo info;
+        if (query_screen(path, &fd, &info) == NULL) {
+            close(fd);
+            if (same_screen(screen, &info))
+                return 0;                       /* still the same one */
+        }
+        close_screen(screen);                   /* replaced, or gone */
+    }
+    if (open_screen_quietly(screen, path) != NULL)
+        return 0;                               /* nothing to draw on yet; try again next time */
+    clear_screen(screen);
+    return 1;
 }
 
 /* The text console draws a blinking cursor onto the same screen memory we draw to.
@@ -287,6 +385,9 @@ static void hide_cursor(void)
  * If it is smaller, the border stays black (clear_screen painted it). */
 static void draw_frame(Screen *screen, const Pack *pack, const uint8_t *frame)
 {
+    if (!screen->valid)
+        return;
+
     uint32_t copy_width  = pack->width  < screen->width  ? pack->width  : screen->width;
     uint32_t copy_height = pack->height < screen->height ? pack->height : screen->height;
 
@@ -403,7 +504,11 @@ int main(int argc, char **argv)
     Pack   pack;
     Screen screen;
     load_pack(&pack, pack_path);
-    open_screen(&screen, screen_path);
+    const char *problem = open_screen_quietly(&screen, screen_path);
+    if (problem) {
+        fprintf(stderr, "player: %s: %s\n", screen_path, problem);
+        return 1;
+    }
     clear_screen(&screen);
     hide_cursor();
 
@@ -427,6 +532,8 @@ int main(int argc, char **argv)
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    const uint8_t *shown = NULL;     /* the last frame we drew, to redraw after a screen change */
+
     for (uint32_t frame = 0; frame < pack.frame_count && !quit_requested; frame++) {
         if (elapsed_ns(start) >= timeout_ns)
             break;
@@ -435,7 +542,9 @@ int main(int argc, char **argv)
         uint8_t *previous = (frame == 0) ? NULL : buffers[(frame + 1) % 2];
 
         decode_frame(&pack, frame, previous, current);
+        follow_screen(&screen, screen_path);   /* switch if the framebuffer was replaced */
         draw_frame(&screen, &pack, current);
+        shown = current;
 
         /* Wait for the next frame, but never past the timeout. */
         sleep_until(start, min_u64(frame_start_time_ns(&pack, frame + 1), timeout_ns));
@@ -447,9 +556,13 @@ int main(int argc, char **argv)
                                               : animation_end_ns + (uint64_t)hold_seconds * 1000000000ULL;
     uint64_t stop_ns = min_u64(hold_end_ns, timeout_ns);
 
-    /* Sleep in slices of at most one second, so a signal or the deadline is noticed promptly. */
-    while (!quit_requested && elapsed_ns(start) < stop_ns)
-        sleep_until(start, min_u64(elapsed_ns(start) + 1000000000ULL, stop_ns));
+    /* Sleep in slices of 0.1 s, so a signal or the deadline is noticed promptly. Each slice also
+     * checks the framebuffer: the swap to the real graphics driver can happen while we hold. */
+    while (!quit_requested && elapsed_ns(start) < stop_ns) {
+        if (follow_screen(&screen, screen_path) && shown != NULL)
+            draw_frame(&screen, &pack, shown);
+        sleep_until(start, min_u64(elapsed_ns(start) + 100000000ULL, stop_ns));
+    }
 
     if (!quit_requested && timeout_ns < hold_end_ns && elapsed_ns(start) >= timeout_ns)
         fprintf(stderr, "player: timeout of %ld s reached, exiting\n", timeout_seconds);

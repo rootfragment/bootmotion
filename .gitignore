@@ -8,3 +8,8 @@ maker/extracted/
 *.zip
 player/build/
 player/player
+vm/kernel
+vm/initrd.gz
+vm/vars.fd
+vm/root/
+vm/player-static
