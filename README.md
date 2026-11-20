@@ -15,8 +15,11 @@ The player currently runs only when you start it by hand from a text console. No
 | Maker: video/GIF to `.bsp`, `info`, `extract` | done, tested |
 | `check.py` pack verification | done, tested |
 | Player: framebuffer (`/dev/fb0`) | done; works on the author's laptop from a text console |
+| Player: quit signal, timeout, cursor hiding | done |
+| Player: framebuffer swap handling | written and tested on a fake framebuffer; not yet confirmed on real hardware |
+| Early boot in QEMU | `/dev/fb0` exists at ~1 s; the animation plays once the kernel has a screen console |
 | Player: DRM/KMS backend (vsync) | not started |
-| Run at boot (quit signal, timeout, initramfs hook) | not started |
+| systemd service, initramfs hook, content check | not started |
 
 ## Requirements
 
@@ -97,19 +100,46 @@ The player prints nothing when it succeeds, and prints one error line and exits 
 - Waits until a fixed point in time for each frame, so a late frame does not delay all the ones after it.
 - Plays once, holds the last frame for 3 seconds (`HOLD_SECONDS`), then exits. There is no loop.
 
+**Framebuffer swap handling**
+
+On a machine with an early firmware framebuffer, `/dev/fb0` can change owner while the animation is playing. On the author's laptop the kernel journal shows:
+
+| Kernel time | Event |
+|---|---|
+| ~1 s | `simpledrm` provides `fb0`, the early firmware framebuffer |
+| ~5.9 s | `amdgpu` replaces it as `fb0` |
+| ~7.3 s | GDM, the login screen, takes over |
+
+A player that keeps drawing into its original mapping would stop reaching the screen after the handover. To cope with this, the player tracks which framebuffer it is drawing on:
+
+- `query_screen()` asks the driver which framebuffer `/dev/fb0` currently is.
+- `same_screen()` compares its name, memory address and size with the one the player is drawing on.
+- `follow_screen()` runs before every frame. If the framebuffer changed, it drops the old mapping, maps the new one, clears it, and tells the caller to redraw the current frame.
+- During the final hold, the player checks every 0.1 s (instead of sleeping for 1 s), so a swap after the animation ends still gets the last frame redrawn.
+- `open_screen_quietly()` and `close_screen()` open and close the device without exiting. If `/dev/fb0` disappears briefly, the player keeps running and retries. If there is no framebuffer at startup, it still prints one error line and exits with code 1.
+
+This is polling: roughly one extra check per frame plus ten per second during the hold. The cost is negligible, but a swap can leave the screen stale for up to 100 ms during the hold. An event-driven version is listed under Next steps.
+
 ## Verified results
 
 - Maker: `boot.mp4` at 1366x768, 24 fps, 3 s gave 72 frames, 302.1 MB raw down to 38.3 MB. `check.py` passed, with pixels within 4 of 255 of an independent ffmpeg extraction (colour-conversion rounding).
 - Player, against a plain file standing in for `/dev/fb0`: the final frame matched byte for byte on same-size, larger and smaller screens; a 2 s pack plus the 3 s hold took 5.01 s; truncated, random, empty and missing files each gave one error line; a sanitizer build found no memory errors.
+- Player, swap handling, against a fake framebuffer with a simulated driver swap:
+  - A swap mid-animation: the new screen received the correct final frame and the old one was no longer written.
+  - A swap during the hold: the last frame was redrawn.
+  - The framebuffer missing for 1.2 s, then returning: the player stayed alive and redrew.
+  - A sanitizer build found no memory errors.
 - Player, on real hardware: the animation played correctly from a text console on the author's laptop. This is one machine, so other drivers are untested.
-- Fixed blinking cursor on boot animation without switching terminal to graphics mode to avoid being stuck at boot in graphics mode. 
+- Fixed blinking cursor on boot animation without switching terminal to graphics mode to avoid being stuck at boot in graphics mode.
 
 ## Known limits
 
 - The player needs a 32 bits-per-pixel framebuffer and exits with an error otherwise.
 - It never skips frames, so on a slow machine playback runs slow instead of dropping frames.
 - A pack is fixed to one resolution. A different screen size gets a cropped or bordered picture, so make one pack per screen.
-- It does not run at boot, and there is no quit signal or timeout yet.
+- It does not run at boot yet; nothing starts it automatically.
+- Swap handling has not been tried on real hardware. How `amdgpu` behaves at the handover, including whether there is a visible flicker and how long it lasts, is unknown.
+- Swap detection is polling, not event-driven (see Next steps).
 - Compression ratio depends on the video. Heavy motion packs much larger than mostly static footage.
 - Auto-detect after the DRM-first fix has not been confirmed on real hardware. Passing `--res` always works.
 
@@ -133,5 +163,9 @@ player/
 
 ## Next steps
 
-1. Add a quit signal and a timeout so the player can never hang the screen, then an initramfs hook so it starts before the desktop. Test in QEMU first, and keep Plymouth as a fallback.
-2. Optionally switch the display backend to DRM/KMS for tear-free playback.
+1. Confirm swap handling on real hardware: rerun `strace -c` on the new build and check what happens when `amdgpu` takes over.
+2. Write a systemd service that is active only when the kernel command line contains `bootmotion`, with `Restart=on-failure` as the fallback. Test in QEMU first, and keep Plymouth as a fallback.
+3. Add a content check: after drawing, read back a few pixels and redraw if something painted over the picture.
+4. Replace the swap polling with kernel events: wait on a `NETLINK_KOBJECT_UEVENT` socket and a `timerfd` with `poll()`, run `follow_screen()` when a graphics uevent arrives, and keep a slow `same_screen()` check as a backstop. Which uevents the `amdgpu` handover emits needs to be checked on real hardware first.
+5. Optionally load `amdgpu` early in the initramfs so the handover happens before the animation starts.
+6. Optionally switch the display backend to DRM/KMS for tear-free playback.
